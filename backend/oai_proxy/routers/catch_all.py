@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+import json
 from functools import lru_cache
 from urllib.parse import quote
 
@@ -9,9 +10,9 @@ from starlette.responses import StreamingResponse
 
 from api.util.aes_gcm import decrypt_token, derive_key
 from oai_proxy.core.config import settings
+from oai_proxy.util.translate import openai_to_gemini, openai_to_claude
 
 
-OPENAI_BASE_URL = 'https://api.openai.com'
 # Marker token that triggers use of the static key
 STATIC_KEY_MARKER = 'STATIC'
 HOP_BY_HOP_HEADERS = {
@@ -95,9 +96,29 @@ async def _proxy_request(request: Request, path: str) -> StreamingResponse:
 
     target_path = path.lstrip('/')
     encoded_path = quote(target_path, safe='/')
-    target_url = f'{OPENAI_BASE_URL}/{encoded_path}' if encoded_path else OPENAI_BASE_URL
+    
+    base_url = settings.OAI_PROXY_BASE_URL.rstrip('/')
+    
+    body_bytes = await request.body()
+    body_json = None
+    try:
+        body_json = json.loads(body_bytes)
+    except Exception:
+        pass
 
-    body = request.stream()
+    if body_json and encoded_path.endswith("chat/completions"):
+        model = body_json.get("model", "")
+        if "gemini" in model.lower():
+            body_json = openai_to_gemini(body_json)
+            body_bytes = json.dumps(body_json).encode()
+            encoded_path = f"v1beta/models/{model}:generateContent"
+        elif "claude" in model.lower():
+            body_json = openai_to_claude(body_json)
+            body_bytes = json.dumps(body_json).encode()
+            encoded_path = "v1/messages"
+
+    target_url = f'{base_url}/{encoded_path}' if encoded_path else base_url
+
     params = request.query_params
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None))
@@ -107,7 +128,7 @@ async def _proxy_request(request: Request, path: str) -> StreamingResponse:
             target_url,
             params=params,
             headers=forward_headers,
-            content=body,
+            content=body_bytes,
         ),
         stream=True,
     )
